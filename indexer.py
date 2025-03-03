@@ -6,6 +6,7 @@ from bs4 import BeautifulSoup
 from nltk.stem import PorterStemmer
 import re
 from collections import defaultdict
+import math
 
 class Posting:
     def __init__(self, doc_id, term_freq=1, importance_score=1.0):
@@ -23,6 +24,7 @@ class InvertedIndex:
             'h1': 3.0, 'h2': 2.5, 'h3': 2.0,
             'title': 3.0, 'b': 1.5, 'strong': 1.5
         }
+        self.min_doc_length = 50  # Minimum document length threshold
         
     def clean_and_tokenize(self, text):
         """Clean and tokenize text, returning stemmed tokens with their importance scores."""
@@ -54,7 +56,11 @@ class InvertedIndex:
         return result, len(words)
     
     def add_tokens(self, tokens_with_importance, doc_length, doc_id):
-        """Add tokens from a document to the index with normalized frequencies."""
+        """Add tokens from a document to the index with logarithmic scaling."""
+        # Skip documents that are too short
+        if doc_length < self.min_doc_length:
+            return
+            
         # Count frequency and track importance of each token in document
         term_freq = defaultdict(int)
         term_importance = defaultdict(float)
@@ -63,13 +69,14 @@ class InvertedIndex:
             term_freq[token] += 1
             term_importance[token] = max(term_importance[token], importance)
         
-        # Add to inverted index with normalized frequencies
+        # Add to inverted index with logarithmic scaling
         for token, freq in term_freq.items():
             if token not in self.index:
                 self.index[token] = []
             
-            # Normalize frequency by document length and multiply by importance
-            normalized_freq = (freq / doc_length) * term_importance[token]
+            # Use logarithmic scaling for term frequency: 1 + log(tf)
+            # This dampens the effect of high frequency terms without penalizing long documents too much
+            normalized_freq = (1 + math.log10(freq)) / math.log10(1 + doc_length)
             self.index[token].append(Posting(doc_id, normalized_freq, term_importance[token]))
         
         # Check if we need to write a partial index

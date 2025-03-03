@@ -5,6 +5,7 @@ from nltk.stem import PorterStemmer
 import re
 import os
 import time
+import math
 
 class DiskIndex:
     def __init__(self):
@@ -62,15 +63,15 @@ class DiskIndex:
         postings_file.seek(offset)
         postings_bytes = postings_file.read(length)
         
-        # Each posting is 8 bytes (4 for doc_id, 4 for tf)
-        num_postings = len(postings_bytes) // 8
+        # Each posting is 12 bytes (4 for doc_id, 4 for tf, 4 for importance)
+        num_postings = len(postings_bytes) // 12
         postings = []
         
         for i in range(num_postings):
-            start = i * 8
-            doc_id_hash, tf = struct.unpack("II", postings_bytes[start:start + 8])
+            start = i * 12
+            doc_id_hash, tf, importance = struct.unpack("Iff", postings_bytes[start:start + 12])
             doc_id = self.doc_id_map[doc_id_hash]
-            postings.append((doc_id, tf))
+            postings.append((doc_id, tf, importance))
         
         return postings
     
@@ -82,14 +83,16 @@ class DiskIndex:
         query_terms = re.findall(r'[a-z0-9]+', query.lower())
         query_terms = [self.stemmer.stem(term) for term in query_terms]
         
-        # Get postings for each query term
-        results = defaultdict(int)
+        # Get postings and calculate scores for each query term
+        results = defaultdict(float)
         for term in query_terms:
             if term in self.vocab_ranges:
                 postings = self.get_postings(term)
-                for doc_id, tf in postings:
-                    # Simple tf scoring
-                    results[doc_id] += tf
+                for doc_id, tf, importance in postings:
+                    # Score = TF * importance
+                    # TF is already normalized by document length from indexer
+                    score = tf * importance
+                    results[doc_id] += score
         
         # Sort by score
         sorted_results = sorted(results.items(), key=lambda x: x[1], reverse=True)
@@ -114,7 +117,7 @@ def main():
         print(f"\nSearch completed in {search_time:.4f} seconds")
         print(f"Found {len(results)} matching documents:")
         for doc_id, score in results[:10]:  # Show top 10 results
-            print(f"Score: {score:5d} - Document: {doc_id}")
+            print(f"Score: {score:.4f} - Document: {doc_id}")
     
     index.close()
 

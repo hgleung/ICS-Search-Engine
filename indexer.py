@@ -8,44 +8,69 @@ import re
 from collections import defaultdict
 
 class Posting:
-    def __init__(self, doc_id, term_freq = 1):
+    def __init__(self, doc_id, term_freq=1, importance_score=1.0):
         self.doc_id = doc_id
         self.term_freq = term_freq
+        self.importance_score = importance_score
 
 class InvertedIndex:
-    def __init__(self, partial_index_size = 50000):
+    def __init__(self, partial_index_size=50000):
         self.index = {}
         self.stemmer = PorterStemmer()
         self.partial_index_size = partial_index_size
         self.partial_index_count = 0
+        self.important_tags = {
+            'h1': 3.0, 'h2': 2.5, 'h3': 2.0,
+            'title': 3.0, 'b': 1.5, 'strong': 1.5
+        }
         
     def clean_and_tokenize(self, text):
-        """Clean and tokenize text, returning stemmed tokens."""
-        # Handle broken HTML
+        """Clean and tokenize text, returning stemmed tokens with their importance scores."""
         try:
             soup = BeautifulSoup(text, 'html.parser')
+            
+            # Initialize token importance tracking
+            token_importance = defaultdict(float)
+            
+            # Process each important tag
+            for tag_name, importance in self.important_tags.items():
+                for tag in soup.find_all(tag_name):
+                    words = re.findall(r'[a-z0-9]+', tag.get_text().lower())
+                    stemmed_words = [self.stemmer.stem(word) for word in words]
+                    for word in stemmed_words:
+                        token_importance[word] = max(token_importance[word], importance)
+            
+            # Process all text
             text = soup.get_text()
         except:
-            pass  # If HTML parsing fails, use raw text
+            text = text  # If HTML parsing fails, use raw text
             
-        # Find words (alphanumeric sequences)
+        # Find all words
         words = re.findall(r'[a-z0-9]+', text.lower())
+        stemmed_words = [self.stemmer.stem(word) for word in words]
         
-        # Stem words
-        return [self.stemmer.stem(word) for word in words]
+        # For words not in important tags, ensure they have at least importance 1.0
+        result = [(word, token_importance.get(word, 1.0)) for word in stemmed_words]
+        return result, len(words)
     
-    def add_tokens(self, tokens, doc_id):
-        """Add tokens from a document to the index."""
-        # Count frequency of each token in document
+    def add_tokens(self, tokens_with_importance, doc_length, doc_id):
+        """Add tokens from a document to the index with normalized frequencies."""
+        # Count frequency and track importance of each token in document
         term_freq = defaultdict(int)
-        for token in tokens:
-            term_freq[token] += 1
+        term_importance = defaultdict(float)
         
-        # Add to inverted index
+        for token, importance in tokens_with_importance:
+            term_freq[token] += 1
+            term_importance[token] = max(term_importance[token], importance)
+        
+        # Add to inverted index with normalized frequencies
         for token, freq in term_freq.items():
             if token not in self.index:
                 self.index[token] = []
-            self.index[token].append(Posting(doc_id, freq))
+            
+            # Normalize frequency by document length and multiply by importance
+            normalized_freq = (freq / doc_length) * term_importance[token]
+            self.index[token].append(Posting(doc_id, normalized_freq, term_importance[token]))
         
         # Check if we need to write a partial index
         if len(self.index) >= self.partial_index_size:
@@ -53,8 +78,8 @@ class InvertedIndex:
     
     def process_document(self, doc_id, content):
         """Process a document and add its tokens to the index."""
-        tokens = self.clean_and_tokenize(content)
-        self.add_tokens(tokens, doc_id)
+        tokens_with_importance, doc_length = self.clean_and_tokenize(content)
+        self.add_tokens(tokens_with_importance, doc_length, doc_id)
     
     def _write_partial_index(self):
         """Write current index to disk as a partial index."""
@@ -129,8 +154,8 @@ class InvertedIndex:
                         # Hash document ID to 32-bit unsigned int
                         doc_id_hash = hash(posting.doc_id) & 0xFFFFFFFF
                         
-                        # Write doc_id_hash and term_freq
-                        postings_file.write(struct.pack("II", doc_id_hash, posting.term_freq))
+                        # Write doc_id_hash, term_freq, and importance_score
+                        postings_file.write(struct.pack("Iff", doc_id_hash, posting.term_freq, posting.importance_score))
                     
                     # Calculate postings length
                     postings_length = postings_file.tell() - start_pos

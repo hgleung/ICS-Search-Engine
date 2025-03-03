@@ -1,0 +1,10 @@
+__pycache__/
+DEV/
+index_files/
+
+*.pdf
+*.zip
+
+.DS_Store
+
+todo.txt

@@ -119,14 +119,15 @@ class InvertedIndex:
         
         # Create ranges for terms
         all_terms = sorted(merged_index.keys())
-        range_size = len(all_terms) // 4  # Split into 4 ranges
+        num_ranges = 4  # We want exactly 4 ranges
+        terms_per_range = (len(all_terms) + num_ranges - 1) // num_ranges  # Ceiling division
         
         # Create output directories
         os.makedirs("index_files", exist_ok=True)
         
         # Process each range
-        for i in range(0, len(all_terms), range_size):
-            range_terms = all_terms[i:i+range_size]
+        for i in range(0, len(all_terms), terms_per_range):
+            range_terms = all_terms[i:min(i + terms_per_range, len(all_terms))]
             if not range_terms:
                 continue
                 

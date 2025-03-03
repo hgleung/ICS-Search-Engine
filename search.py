@@ -14,6 +14,9 @@ class DiskIndex:
         with open("index_files/docid_map.pkl", "rb") as f:
             self.doc_id_map = pickle.load(f)
         
+        # Calculate total number of documents for IDF
+        self.total_docs = len(self.doc_id_map)
+        
         # Load vocabulary ranges
         print("Loading vocabulary ranges...")
         self.vocab_ranges = {}  # term -> (vocab_file, postings_file)
@@ -75,8 +78,16 @@ class DiskIndex:
         
         return postings
     
+    def calculate_idf(self, term):
+        """Calculate IDF for a term."""
+        if term not in self.vocab_ranges:
+            return 0
+        df = self.vocab_ranges[term]['df']
+        # Add 1 to denominator to prevent division by zero and smooth IDF
+        return math.log10(self.total_docs / (df + 1))
+    
     def search(self, query):
-        """Search for documents matching the query."""
+        """Search for documents matching the query using TF-IDF and importance scoring."""
         start_time = time.time()
         
         # Tokenize and stem query
@@ -87,11 +98,15 @@ class DiskIndex:
         results = defaultdict(float)
         for term in query_terms:
             if term in self.vocab_ranges:
+                # Calculate IDF for term
+                idf = self.calculate_idf(term)
+                
+                # Get postings
                 postings = self.get_postings(term)
                 for doc_id, tf, importance in postings:
-                    # Score = TF * importance
-                    # TF is already normalized by document length from indexer
-                    score = tf * importance
+                    # Score = TF * IDF * importance
+                    # TF is already logarithmically scaled from indexer
+                    score = tf * idf * importance
                     results[doc_id] += score
         
         # Sort by score

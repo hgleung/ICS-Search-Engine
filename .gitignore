@@ -1,6 +1,7 @@
 __pycache__/
 DEV/
 index_files/
+partial_indexes/
 
 *.pdf
 *.zip

@@ -84,7 +84,7 @@ class DiskIndex:
             return 0
         df = self.vocab_ranges[term]['df']
         # Add 1 to denominator to prevent division by zero and smooth IDF
-        return math.log10(self.total_docs / (df + 1))
+        return math.log10(self.total_docs / df) if df > 0 else 0
     
     def search(self, query):
         """Search for documents matching the query using TF-IDF and importance scoring."""

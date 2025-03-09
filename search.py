@@ -7,6 +7,7 @@ import os
 import time
 import math
 import sys
+from urllib.parse import urldefrag
 
 class DiskIndex:
     def __init__(self):
@@ -70,12 +71,20 @@ class DiskIndex:
         # Each posting is 12 bytes (4 for doc_id, 4 for tf, 4 for importance)
         num_postings = len(postings_bytes) // 12
         postings = []
+        seen_urls = set()  # Track seen defragged URLs
         
         for i in range(num_postings):
             start = i * 12
             doc_id_hash, tf, importance = struct.unpack("Iff", postings_bytes[start:start + 12])
             doc_id = self.doc_id_map[doc_id_hash]
-            postings.append((doc_id, tf, importance))
+            
+            # Defragment URL
+            defragged_url, _ = urldefrag(doc_id)
+            
+            # Skip if we've seen this URL before
+            if defragged_url not in seen_urls:
+                seen_urls.add(defragged_url)
+                postings.append((defragged_url, tf, importance))
         
         return postings
     
@@ -102,11 +111,12 @@ class DiskIndex:
         
         # Get postings and calculate scores for each query term
         results = defaultdict(float)
+        
         for term, _ in query_terms_with_df:
             # Calculate IDF for term
             idf = self.calculate_idf(term)
             
-            # Get postings
+            # Get postings (already deduplicated)
             postings = self.get_postings(term)
             for doc_id, tf, importance in postings:
                 # Score = TF * IDF * importance
@@ -114,22 +124,33 @@ class DiskIndex:
                 score = tf * idf * importance
                 results[doc_id] += score
         
-        # Sort by score
+        # Sort by score and remove duplicates with identical scores
         sorted_results = sorted(results.items(), key=lambda x: x[1], reverse=True)
+        
+        # Filter out documents with identical scores (keeping first occurrence)
+        unique_results = []
+        seen_scores = set()
+        for doc_id, score in sorted_results:
+            # Round to handle floating point precision
+            rounded_score = round(score, 6)
+            if rounded_score not in seen_scores:
+                unique_results.append((doc_id, score))
+                seen_scores.add(rounded_score)
+        
         search_time = time.time() - start_time
-        return sorted_results, search_time
+        return unique_results, search_time
     
-    def close(self):
-        """Close all postings files."""
-        for file in self.postings_files.values():
-            file.close()
-
     def run_query(self, query):
         results, search_time = self.search(query)
         print(f"\nSearch completed in {search_time*1000:.0f} milliseconds")
         print(f"Found {len(results)} matching documents:")
         for doc_id, score in results[:10]:  # Show top 10 results
             print(f"Score: {score:.4f} - Document: {doc_id}")
+
+    def close(self):
+        """Close all postings files."""
+        for file in self.postings_files.values():
+            file.close()
 
 def main():
     index = DiskIndex()

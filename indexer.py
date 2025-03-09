@@ -7,12 +7,23 @@ from nltk.stem import PorterStemmer
 import re
 from collections import defaultdict
 import math
+import heapq
 
 class Posting:
     def __init__(self, doc_id, term_freq=1, importance_score=1.0):
         self.doc_id = doc_id
         self.term_freq = term_freq
         self.importance_score = importance_score
+
+class TermEntry:
+    """Helper class for multi-way merge to ensure proper term comparison"""
+    def __init__(self, term: str, postings: list, file_idx: int):
+        self.term = term
+        self.postings = postings
+        self.file_idx = file_idx
+    
+    def __lt__(self, other):
+        return self.term < other.term
 
 class InvertedIndex:
     def __init__(self, partial_index_size=50000):
@@ -106,85 +117,153 @@ class InvertedIndex:
         self.index.clear()
     
     def _merge_partial_indexes(self):
-        """Merge all partial indexes and split into term ranges."""
+        """Merge all partial indexes using a multi-way merge with buffered I/O."""
         if not os.path.exists("partial_indexes"):
             return
             
         print("Merging partial indexes...")
-        merged_index = defaultdict(list)
-        
-        # Load and merge all partial indexes
-        for i in range(self.partial_index_count):
-            partial_path = f"partial_indexes/partial_{i}.pkl"
-            with open(partial_path, "rb") as f:
-                partial_index = pickle.load(f)
-                for term, postings in partial_index.items():
-                    merged_index[term].extend(postings)
-            
-            # Remove partial index file
-            os.remove(partial_path)
-        
-        # Create ranges for terms
-        all_terms = sorted(merged_index.keys())
-        num_ranges = 4  # We want exactly 4 ranges
-        terms_per_range = (len(all_terms) + num_ranges - 1) // num_ranges  # Ceiling division
         
         # Create output directories
         os.makedirs("index_files", exist_ok=True)
         
-        # Process each range
-        for i in range(0, len(all_terms), terms_per_range):
-            range_terms = all_terms[i:min(i + terms_per_range, len(all_terms))]
-            if not range_terms:
-                continue
-                
-            # Determine range name
-            start_term = range_terms[0]
-            end_term = range_terms[-1]
-            range_name = f"{start_term[:2]}-{end_term[:2]}"
-            
-            # Open files for this range
-            vocab_path = f"index_files/vocab_{range_name}.txt"
-            postings_path = f"index_files/postings_{range_name}.bin"
-            
-            with open(vocab_path, "w", encoding="utf-8") as vocab_file, \
-                 open(postings_path, "wb") as postings_file:
-                
-                # Process each term in this range
-                for term in range_terms:
-                    postings = merged_index[term]
-                    
-                    # Record start position for postings
-                    start_pos = postings_file.tell()
-                    
-                    # Write postings
-                    for posting in postings:
-                        # Hash document ID to 32-bit unsigned int
-                        doc_id_hash = hash(posting.doc_id) & 0xFFFFFFFF
-                        
-                        # Write doc_id_hash, term_freq, and importance_score
-                        postings_file.write(struct.pack("Iff", doc_id_hash, posting.term_freq, posting.importance_score))
-                    
-                    # Calculate postings length
-                    postings_length = postings_file.tell() - start_pos
-                    
-                    # Write vocabulary entry
-                    vocab_file.write(f"{term}\t{len(postings)}\t{start_pos}\t{postings_length}\n")
-            
-            print(f"Created index files for range {range_name}")
-        
-        # Create document ID mapping
+        # Initialize doc_id map
         doc_id_map = {}
-        for postings in merged_index.values():
-            for posting in postings:
+        
+        # Open all partial indexes simultaneously
+        partial_files = []
+        term_queues = []  # List[TermEntry]
+        buffer_size = 8192  # 8KB buffer for each file
+        
+        for i in range(self.partial_index_count):
+            f = open(f"partial_indexes/partial_{i}.pkl", "rb")
+            partial_files.append(f)
+            partial_index = pickle.load(f)
+            if partial_index:
+                first_term = min(partial_index.keys())
+                # Create TermEntry for proper heap ordering
+                term_queues.append(TermEntry(first_term, partial_index[first_term], i))
+                # Store remaining terms for this file
+                partial_index.pop(first_term)
+                setattr(partial_files[i], 'remaining_terms', sorted(partial_index.keys()))
+                setattr(partial_files[i], 'current_index', partial_index)
+            f.seek(0)  # Reset file pointer for future reads
+        
+        # Create heapq for efficient minimum term selection
+        heapq.heapify(term_queues)
+        
+        # Track term ranges for splitting into 4 files
+        all_terms = set()
+        for f in partial_files:
+            if hasattr(f, 'remaining_terms'):
+                all_terms.update(f.remaining_terms)
+                if term_queues:  # Check if term_queues is not empty
+                    all_terms.add(term_queues[0].term)  # Add the first term too
+        
+        all_terms = sorted(all_terms)
+        num_ranges = 4
+        terms_per_range = (len(all_terms) + num_ranges - 1) // num_ranges
+        
+        # Initialize variables for range processing
+        current_range_idx = 0
+        current_range_terms = []
+        current_vocab_file = None
+        current_postings_file = None
+        current_range_name = None
+        
+        def write_range_files():
+            nonlocal current_range_terms, current_vocab_file, current_postings_file, current_range_name
+            if current_range_terms:
+                start_term = current_range_terms[0]
+                end_term = current_range_terms[-1]
+                current_range_name = f"{start_term[:2]}-{end_term[:2]}"
+                
+                # Close previous files if open
+                if current_vocab_file:
+                    current_vocab_file.close()
+                if current_postings_file:
+                    current_postings_file.close()
+                
+                # Open new files
+                current_vocab_file = open(f"index_files/vocab_{current_range_name}.txt", "w", encoding="utf-8", buffering=buffer_size)
+                current_postings_file = open(f"index_files/postings_{current_range_name}.bin", "wb", buffering=buffer_size)
+                print(f"Created range files for {current_range_name}")
+                current_range_terms = []
+        
+        # Process terms in sorted order
+        while term_queues:
+            current_entry = heapq.heappop(term_queues)
+            current_term = current_entry.term
+            current_postings = current_entry.postings
+            file_idx = current_entry.file_idx
+            
+            # Add term to current range
+            current_range_terms.append(current_term)
+            
+            # Create first range files if none exist
+            if current_vocab_file is None:
+                write_range_files()
+            # If we've filled a range, write it out
+            elif len(current_range_terms) >= terms_per_range:
+                write_range_files()
+            
+            # Merge all postings for current_term
+            while term_queues and term_queues[0].term == current_term:
+                next_entry = heapq.heappop(term_queues)
+                current_postings.extend(next_entry.postings)
+                
+                # Load next term from this file
+                if hasattr(partial_files[next_entry.file_idx], 'remaining_terms'):
+                    remaining = partial_files[next_entry.file_idx].remaining_terms
+                    if remaining:
+                        next_term = remaining[0]
+                        remaining.pop(0)
+                        next_postings = partial_files[next_entry.file_idx].current_index[next_term]
+                        del partial_files[next_entry.file_idx].current_index[next_term]
+                        heapq.heappush(term_queues, TermEntry(next_term, next_postings, next_entry.file_idx))
+            
+            # Load next term from current file
+            if hasattr(partial_files[file_idx], 'remaining_terms'):
+                remaining = partial_files[file_idx].remaining_terms
+                if remaining:
+                    next_term = remaining[0]
+                    remaining.pop(0)
+                    next_postings = partial_files[file_idx].current_index[next_term]
+                    del partial_files[file_idx].current_index[next_term]
+                    heapq.heappush(term_queues, TermEntry(next_term, next_postings, file_idx))
+            
+            # Write current term's postings
+            start_pos = current_postings_file.tell()
+            
+            # Write postings
+            for posting in current_postings:
                 doc_id_hash = hash(posting.doc_id) & 0xFFFFFFFF
                 doc_id_map[doc_id_hash] = posting.doc_id
+                current_postings_file.write(struct.pack("Iff", doc_id_hash, posting.term_freq, posting.importance_score))
+            
+            # Calculate postings length
+            postings_length = current_postings_file.tell() - start_pos
+            
+            # Write vocabulary entry
+            current_vocab_file.write(f"{current_term}\t{len(current_postings)}\t{start_pos}\t{postings_length}\n")
+        
+        # Write final range if needed
+        write_range_files()
+        
+        # Close all files
+        for f in partial_files:
+            f.close()
+        if current_vocab_file:
+            current_vocab_file.close()
+        if current_postings_file:
+            current_postings_file.close()
         
         # Save document ID mapping
         with open("index_files/docid_map.pkl", "wb") as f:
             pickle.dump(doc_id_map, f)
         
-        # Remove partial indexes directory
+        # Remove partial indexes
+        for i in range(self.partial_index_count):
+            os.remove(f"partial_indexes/partial_{i}.pkl")
         os.rmdir("partial_indexes")
         
         # Print statistics

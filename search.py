@@ -6,6 +6,7 @@ import re
 import os
 import time
 import math
+import sys
 
 class DiskIndex:
     def __init__(self):
@@ -119,20 +120,30 @@ class DiskIndex:
         for file in self.postings_files.values():
             file.close()
 
-def main():
-    # Example usage
-    index = DiskIndex()
-    
-    while True:
-        query = input("\nEnter search query (or 'quit' to exit): ")
-        if query.lower() == 'quit':
-            break
-            
-        results, search_time = index.search(query)
-        print(f"\nSearch completed in {search_time:.4f} seconds")
+    def run_query(self, query):
+        results, search_time = self.search(query)
+        print(f"\nSearch completed in {search_time*1000:.0f} milliseconds")
         print(f"Found {len(results)} matching documents:")
         for doc_id, score in results[:10]:  # Show top 10 results
             print(f"Score: {score:.4f} - Document: {doc_id}")
+
+def main():
+    index = DiskIndex()
+
+    if len(sys.argv) > 1:
+        input_file = sys.argv[1]
+        with open(input_file, 'r') as f:
+            queries = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+        for query in queries:
+            print("\n" + query)
+            index.run_query(query)
+    else:
+        while True:
+            query = input("\nEnter search query (or 'quit' to exit): ")
+            if query.lower() == 'quit':
+                break
+                
+            index.run_query(query)
     
     index.close()
 

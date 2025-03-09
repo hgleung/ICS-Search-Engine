@@ -95,20 +95,24 @@ class DiskIndex:
         query_terms = re.findall(r'[a-z0-9]+', query.lower())
         query_terms = [self.stemmer.stem(term) for term in query_terms]
         
+        # Filter to terms in vocabulary and sort by ascending df
+        query_terms_with_df = [(term, self.vocab_ranges[term]['df']) 
+                             for term in query_terms if term in self.vocab_ranges]
+        query_terms_with_df.sort(key=lambda x: x[1])  # Sort by df
+        
         # Get postings and calculate scores for each query term
         results = defaultdict(float)
-        for term in query_terms:
-            if term in self.vocab_ranges:
-                # Calculate IDF for term
-                idf = self.calculate_idf(term)
-                
-                # Get postings
-                postings = self.get_postings(term)
-                for doc_id, tf, importance in postings:
-                    # Score = TF * IDF * importance
-                    # TF is already logarithmically scaled from indexer
-                    score = tf * idf * importance
-                    results[doc_id] += score
+        for term, _ in query_terms_with_df:
+            # Calculate IDF for term
+            idf = self.calculate_idf(term)
+            
+            # Get postings
+            postings = self.get_postings(term)
+            for doc_id, tf, importance in postings:
+                # Score = TF * IDF * importance
+                # TF is already logarithmically scaled from indexer
+                score = tf * idf * importance
+                results[doc_id] += score
         
         # Sort by score
         sorted_results = sorted(results.items(), key=lambda x: x[1], reverse=True)

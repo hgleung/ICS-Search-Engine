@@ -96,7 +96,7 @@ class DiskIndex:
         # Add 1 to denominator to prevent division by zero and smooth IDF
         return math.log10(self.total_docs / df) if df > 0 else 0
     
-    def search(self, query):
+    def search(self, query, k=1000):
         """Search for documents matching the query using TF-IDF and importance scoring."""
         start_time = time.time()
         
@@ -111,8 +111,30 @@ class DiskIndex:
         
         # Get postings and calculate scores for each query term
         results = defaultdict(float)
+        max_possible_remaining_score = 0
+        min_score_in_top_k = 0
+        processed_terms = 0
         
-        for term, _ in query_terms_with_df:
+        for term, df in query_terms_with_df:
+            # Calculate maximum possible score contribution from remaining terms
+            # Since terms are sorted by df, all remaining terms have df >= current df
+            # Maximum TF is pre-normalized as (1 + log10(freq)) / log10(1 + doc_length)
+            # Maximum importance score is 1.0
+            idf_current = math.log10(self.total_docs / df) if df > 0 else 0
+            max_possible_remaining_score = 0
+            
+            # Calculate max possible score from remaining terms including current
+            remaining_terms = len(query_terms_with_df) - processed_terms
+            if remaining_terms > 0:
+                # Conservative estimate: assume remaining terms have same df as current
+                # and max normalized TF (1.0) and max importance (1.0)
+                max_possible_remaining_score = remaining_terms * (1.0 * idf_current * 1.0)
+            
+            # If we have at least k results and max possible remaining score
+            # can't change top k, we can stop
+            if len(results) >= k and max_possible_remaining_score < min_score_in_top_k:
+                break
+                
             # Calculate IDF for term
             idf = self.calculate_idf(term)
             
@@ -123,6 +145,12 @@ class DiskIndex:
                 # TF is already logarithmically scaled from indexer
                 score = tf * idf * importance
                 results[doc_id] += score
+            
+            # Update minimum score in top k if we have enough results
+            if len(results) >= k:
+                min_score_in_top_k = sorted(results.values(), reverse=True)[k-1]
+            
+            processed_terms += 1
         
         # Sort by score and remove duplicates with identical scores
         sorted_results = sorted(results.items(), key=lambda x: x[1], reverse=True)
@@ -136,6 +164,8 @@ class DiskIndex:
             if rounded_score not in seen_scores:
                 unique_results.append((doc_id, score))
                 seen_scores.add(rounded_score)
+                if len(unique_results) >= k:
+                    break
         
         search_time = time.time() - start_time
         return unique_results, search_time

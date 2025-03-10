@@ -35,7 +35,6 @@ class InvertedIndex:
             'h1': 3.0, 'h2': 2.5, 'h3': 2.0,
             'title': 3.0, 'b': 1.5, 'strong': 1.5
         }
-        self.min_doc_length = 50  # Minimum document length threshold
         
     def clean_and_tokenize(self, text):
         """Clean and tokenize text, returning stemmed tokens with their importance scores."""
@@ -69,7 +68,7 @@ class InvertedIndex:
     def add_tokens(self, tokens_with_importance, doc_length, doc_id):
         """Add tokens from a document to the index with logarithmic scaling."""
         # Skip documents that are too short
-        if doc_length < self.min_doc_length:
+        if doc_length < 50:
             return
             
         # Count frequency and track importance of each token in document
@@ -87,7 +86,7 @@ class InvertedIndex:
             
             # Use logarithmic scaling for term frequency: 1 + log(tf)
             # This dampens the effect of high frequency terms without penalizing long documents too much
-            normalized_freq = (1 + math.log10(freq)) / math.log10(1 + doc_length)
+            normalized_freq = (1 + math.log10(freq)) / math.log10(doc_length)
             self.index[token].append(Posting(doc_id, normalized_freq, term_importance[token]))
         
         # Check if we need to write a partial index

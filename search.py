@@ -151,6 +151,8 @@ class DiskIndex:
                 min_score_in_top_k = sorted(results.values(), reverse=True)[k-1]
             
             processed_terms += 1
+
+        search_time = time.time() - start_time
         
         # Sort by score and remove duplicates with identical scores
         sorted_results = sorted(results.items(), key=lambda x: x[1], reverse=True)
@@ -167,7 +169,6 @@ class DiskIndex:
                 if len(unique_results) >= k:
                     break
         
-        search_time = time.time() - start_time
         return unique_results, search_time
     
     def run_query(self, query):

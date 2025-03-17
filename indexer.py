@@ -8,6 +8,10 @@ import re
 from collections import defaultdict
 import math
 import heapq
+import concurrent.futures
+import threading
+import time
+from functools import lru_cache
 
 class Posting:
     def __init__(self, doc_id, term_freq=1, importance_score=1.0):
@@ -26,7 +30,7 @@ class TermEntry:
         return self.term < other.term
 
 class InvertedIndex:
-    def __init__(self, partial_index_size=50000):
+    def __init__(self, partial_index_size=50000, num_workers=8, batch_size=100):
         self.index = {}
         self.stemmer = PorterStemmer()
         self.partial_index_size = partial_index_size
@@ -35,6 +39,17 @@ class InvertedIndex:
             'h1': 3.0, 'h2': 2.5, 'h3': 2.0,
             'title': 3.0, 'b': 1.5, 'strong': 1.5
         }
+        self.num_workers = num_workers
+        self.batch_size = batch_size
+        self.index_lock = threading.Lock()
+        self.count_lock = threading.Lock()
+        self.processed_docs = 0
+        self.total_docs = 0
+        
+    @lru_cache(maxsize=10000)
+    def stem_word(self, word):
+        """Cached stemming for better performance"""
+        return self.stemmer.stem(word)
         
     def clean_and_tokenize(self, text):
         """Clean and tokenize text, returning stemmed tokens with their importance scores."""
@@ -48,7 +63,7 @@ class InvertedIndex:
             for tag_name, importance in self.important_tags.items():
                 for tag in soup.find_all(tag_name):
                     words = re.findall(r'[a-z0-9]+', tag.get_text().lower())
-                    stemmed_words = [self.stemmer.stem(word) for word in words]
+                    stemmed_words = [self.stem_word(word) for word in words]
                     for word in stemmed_words:
                         token_importance[word] = max(token_importance[word], importance)
             
@@ -59,13 +74,13 @@ class InvertedIndex:
             
         # Find all words
         words = re.findall(r'[a-z0-9]+', text.lower())
-        stemmed_words = [self.stemmer.stem(word) for word in words]
+        stemmed_words = [self.stem_word(word) for word in words]
         
         # For words not in important tags, ensure they have at least importance 1.0
         result = [(word, token_importance.get(word, 1.0)) for word in stemmed_words]
         return result, len(words)
     
-    def add_tokens(self, tokens_with_importance, doc_length, doc_id):
+    def add_tokens(self, tokens_with_importance, doc_length, doc_id, local_index=None):
         """Add tokens from a document to the index with logarithmic scaling."""
         # Skip documents that are too short
         if doc_length < 50:
@@ -79,24 +94,48 @@ class InvertedIndex:
             term_freq[token] += 1
             term_importance[token] = max(term_importance[token], importance)
         
+        # Use a local index if provided (for threaded processing)
+        target_index = local_index if local_index is not None else self.index
+        
         # Add to inverted index with logarithmic scaling
         for token, freq in term_freq.items():
-            if token not in self.index:
-                self.index[token] = []
+            if token not in target_index:
+                target_index[token] = []
             
             # Use logarithmic scaling for term frequency: 1 + log(tf)
             # This dampens the effect of high frequency terms without penalizing long documents too much
             normalized_freq = (1 + math.log10(freq)) / math.log10(doc_length)
-            self.index[token].append(Posting(doc_id, normalized_freq, term_importance[token]))
-        
-        # Check if we need to write a partial index
-        if len(self.index) >= self.partial_index_size:
-            self._write_partial_index()
+            target_index[token].append(Posting(doc_id, normalized_freq, term_importance[token]))
     
-    def process_document(self, doc_id, content):
+    def process_document(self, doc_id, content, local_index=None):
         """Process a document and add its tokens to the index."""
         tokens_with_importance, doc_length = self.clean_and_tokenize(content)
-        self.add_tokens(tokens_with_importance, doc_length, doc_id)
+        self.add_tokens(tokens_with_importance, doc_length, doc_id, local_index)
+        
+        # Update processed docs counter
+        with self.count_lock:
+            self.processed_docs += 1
+            if self.processed_docs % 1000 == 0:
+                print(f"Processed {self.processed_docs}/{self.total_docs} documents ({self.processed_docs/self.total_docs*100:.1f}%)")
+    
+    def process_batch(self, batch):
+        """Process a batch of documents and return the local index"""
+        local_index = {}
+        for doc_id, content in batch:
+            self.process_document(doc_id, content, local_index)
+        return local_index
+    
+    def merge_local_index(self, local_index):
+        """Merge a local index into the main index"""
+        with self.index_lock:
+            for term, postings in local_index.items():
+                if term not in self.index:
+                    self.index[term] = []
+                self.index[term].extend(postings)
+            
+            # Check if we need to write a partial index
+            if len(self.index) >= self.partial_index_size:
+                self._write_partial_index()
     
     def _write_partial_index(self):
         """Write current index to disk as a partial index."""
@@ -131,7 +170,7 @@ class InvertedIndex:
         # Open all partial indexes simultaneously
         partial_files = []
         term_queues = []  # List[TermEntry]
-        buffer_size = 8192  # 8KB buffer for each file
+        buffer_size = 16384  # 16KB buffer for each file (increased from 8KB)
         
         for i in range(self.partial_index_count):
             f = open(f"partial_indexes/partial_{i}.pkl", "rb")
@@ -233,11 +272,17 @@ class InvertedIndex:
             # Write current term's postings
             start_pos = current_postings_file.tell()
             
-            # Write postings
+            # Write postings in batches for better performance
+            postings_buffer = bytearray(len(current_postings) * 12)  # Pre-allocate buffer
+            offset = 0
+            
             for posting in current_postings:
                 doc_id_hash = hash(posting.doc_id) & 0xFFFFFFFF
                 doc_id_map[doc_id_hash] = posting.doc_id
-                current_postings_file.write(struct.pack("Iff", doc_id_hash, posting.term_freq, posting.importance_score))
+                struct.pack_into("Iff", postings_buffer, offset, doc_id_hash, posting.term_freq, posting.importance_score)
+                offset += 12
+            
+            current_postings_file.write(postings_buffer)
             
             # Calculate postings length
             postings_length = current_postings_file.tell() - start_pos
@@ -277,32 +322,76 @@ class InvertedIndex:
         print(f"Total postings size: {total_postings_size / 1024:.2f} KB")
         print(f"Document ID map size: {os.path.getsize('index_files/docid_map.pkl') / 1024:.2f} KB")
     
+    def process_documents_parallel(self, document_list):
+        """Process documents in parallel using a thread pool."""
+        print(f"Processing {len(document_list)} documents using {self.num_workers} workers...")
+        self.total_docs = len(document_list)
+        self.processed_docs = 0
+        
+        # Create batches
+        batches = []
+        current_batch = []
+        
+        for doc_id, content in document_list:
+            current_batch.append((doc_id, content))
+            if len(current_batch) >= self.batch_size:
+                batches.append(current_batch)
+                current_batch = []
+                
+        # Add the last batch if it's not empty
+        if current_batch:
+            batches.append(current_batch)
+            
+        print(f"Created {len(batches)} batches of size {self.batch_size}")
+        
+        # Process batches in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+            futures = [executor.submit(self.process_batch, batch) for batch in batches]
+            
+            # Process results as they complete
+            for future in concurrent.futures.as_completed(futures):
+                local_index = future.result()
+                self.merge_local_index(local_index)
+    
     def finalize(self):
         """Write final partial index and merge all indexes."""
         self._write_partial_index()  # Write any remaining terms
         self._merge_partial_indexes()
 
 def main():
-    # Create inverted index
-    index = InvertedIndex(partial_index_size=50000)  # Write partial index every 50k terms
+    start_time = time.time()
     
-    # Process all documents in the DEV directory
+    # Create inverted index with 8 worker threads and batch size of 100
+    # Adjust the number of workers based on your CPU cores
+    index = InvertedIndex(partial_index_size=50000, num_workers=8, batch_size=100)
+    
+    # Collect all documents before processing
+    documents = []
     dev_directory = "DEV"
+    
+    print("Collecting documents...")
     for root, _, files in os.walk(dev_directory):
         for file in files:
             if file.endswith('.json'):
                 file_path = os.path.join(root, file)
                 
-                # Read and process document
-                with open(file_path, 'r') as f:
-                    try:
+                # Read document
+                try:
+                    with open(file_path, 'r') as f:
                         data = json.load(f)
-                        index.process_document(data['url'], data['content'])
-                    except (json.JSONDecodeError, KeyError) as e:
-                        print(f"Error processing {file_path}: {e}")
+                        documents.append((data['url'], data['content']))
+                except (json.JSONDecodeError, KeyError) as e:
+                    print(f"Error reading {file_path}: {e}")
+    
+    # Process all documents in parallel
+    index.process_documents_parallel(documents)
     
     # Finalize index
     index.finalize()
+    
+    # Print total time
+    total_time = time.time() - start_time
+    print(f"\nTotal indexing time: {total_time:.2f} seconds")
 
 if __name__ == "__main__":
     main()

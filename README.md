@@ -99,7 +99,7 @@ Options:
 1. Document vectors are compared using cosine similarity
 2. Quick heuristics filter out obvious non-duplicates
 3. Batched processing manages memory usage
-4. Documents with similarity above threshold are considered duplicates
+4. Documents with similarity above threshold (99%) are considered duplicates
 5. The richer document (more terms) is kept when duplicates are found
 
 ## Performance Considerations

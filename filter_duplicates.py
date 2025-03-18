@@ -2,7 +2,7 @@
 """
 Preprocesses document vectors to remove near-duplicates.
 This script computes cosine similarities between all document vectors and removes
-those with similarity above a specified threshold (default 0.97).
+those with similarity above a specified threshold (default 0.99).
 """
 
 import pickle
@@ -55,7 +55,7 @@ def quick_similarity_check(vec1, vec2):
     
     return True
 
-def detect_and_remove_near_duplicates(doc_vectors, threshold=0.97, batch_size=1000):
+def detect_and_remove_near_duplicates(doc_vectors, threshold=0.99, batch_size=1000):
     """
     Detect and remove near-duplicate documents based on cosine similarity.
     Uses batched processing to manage memory usage.
@@ -151,8 +151,8 @@ def detect_and_remove_near_duplicates(doc_vectors, threshold=0.97, batch_size=10
 
 def main():
     parser = argparse.ArgumentParser(description='Preprocess document vectors to remove near-duplicates')
-    parser.add_argument('--threshold', type=float, default=0.97,
-                      help='Similarity threshold above which documents are considered duplicates (default: 0.97)')
+    parser.add_argument('--threshold', type=float, default=0.99,
+                      help='Similarity threshold above which documents are considered duplicates (default: 0.99)')
     parser.add_argument('--batch-size', type=int, default=1000,
                       help='Number of documents to process in each batch (default: 1000)')
     parser.add_argument('--input-path', type=str, default='index_files/doc_vectors.pkl',

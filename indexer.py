@@ -13,6 +13,7 @@ import concurrent.futures
 import threading
 import time
 from functools import lru_cache
+from filter_duplicates import detect_and_remove_near_duplicates
 
 # Filter out BeautifulSoup warnings
 warnings.filterwarnings("ignore")
@@ -436,10 +437,12 @@ class InvertedIndex:
                                 doc_vectors[doc_id] = {}
                             doc_vectors[doc_id][term] = tfidf
         
+        filtered_vectors = detect_and_remove_near_duplicates(doc_vectors)
+
         # Save document vectors
-        print(f"Saving {len(doc_vectors)} document vectors...")
+        print(f"Saving {len(filtered_vectors)} document vectors...")
         with open("index_files/doc_vectors.pkl", "wb") as f:
-            pickle.dump(doc_vectors, f)
+            pickle.dump(filtered_vectors, f)
         
         print(f"Document vectors saved successfully, size: {os.path.getsize('index_files/doc_vectors.pkl') / (1024*1024):.2f} MB")
 

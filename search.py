@@ -71,20 +71,12 @@ class DiskIndex:
         # Each posting is 12 bytes (4 for doc_id, 4 for tf, 4 for importance)
         num_postings = len(postings_bytes) // 12
         postings = []
-        seen_urls = set()  # Track seen defragged URLs
         
         for i in range(num_postings):
             start = i * 12
             doc_id_hash, tf, importance = struct.unpack("Iff", postings_bytes[start:start + 12])
             doc_id = self.doc_id_map[doc_id_hash]
-            
-            # Defragment URL
-            defragged_url, _ = urldefrag(doc_id)
-            
-            # Skip if we've seen this URL before
-            if defragged_url not in seen_urls:
-                seen_urls.add(defragged_url)
-                postings.append((defragged_url, tf, importance))
+            postings.append((doc_id, tf, importance))
         
         return postings
     
@@ -93,48 +85,21 @@ class DiskIndex:
         if term not in self.vocab_ranges:
             return 0
         df = self.vocab_ranges[term]['df']
-        # Add 1 to denominator to prevent division by zero and smooth IDF
+
         return math.log10(self.total_docs / df) if df > 0 else 0
     
-    def search(self, query, k=1000):
+    def search(self, query):
         """Search for documents matching the query using TF-IDF and importance scoring."""
         start_time = time.time()
         
         # Tokenize and stem query
-        query_terms = re.findall(r'[a-z0-9]+', query.lower())
-        query_terms = [self.stemmer.stem(term) for term in query_terms]
-        
-        # Filter to terms in vocabulary and sort by ascending df
-        query_terms_with_df = [(term, self.vocab_ranges[term]['df']) 
-                             for term in query_terms if term in self.vocab_ranges]
-        query_terms_with_df.sort(key=lambda x: x[1])  # Sort by df
+        query_terms = [self.stemmer.stem(term) for term in re.findall(r'[a-z0-9]+', query.lower())]
         
         # Get postings and calculate scores for each query term
         results = defaultdict(float)
-        max_possible_remaining_score = 0
-        min_score_in_top_k = 0
         processed_terms = 0
         
-        for term, df in query_terms_with_df:
-            # Calculate maximum possible score contribution from remaining terms
-            # Since terms are sorted by df, all remaining terms have df >= current df
-            # Maximum TF is pre-normalized as (1 + log10(freq)) / log10(1 + doc_length)
-            # Maximum importance score is 1.0
-            idf_current = math.log10(self.total_docs / df) if df > 0 else 0
-            max_possible_remaining_score = 0
-            
-            # Calculate max possible score from remaining terms including current
-            remaining_terms = len(query_terms_with_df) - processed_terms
-            if remaining_terms > 0:
-                # Conservative estimate: assume remaining terms have same df as current
-                # and max normalized TF (1.0) and max importance (1.0)
-                max_possible_remaining_score = remaining_terms * (1.0 * idf_current * 1.0)
-            
-            # If we have at least k results and max possible remaining score
-            # can't change top k, we can stop
-            if len(results) >= k and max_possible_remaining_score < min_score_in_top_k:
-                break
-                
+        for term in query_terms:
             # Calculate IDF for term
             idf = self.calculate_idf(term)
             
@@ -145,37 +110,35 @@ class DiskIndex:
                 # TF is already logarithmically scaled from indexer
                 score = tf * idf * importance
                 results[doc_id] += score
-            
-            # Update minimum score in top k if we have enough results
-            if len(results) >= k:
-                min_score_in_top_k = sorted(results.values(), reverse=True)[k-1]
-            
+             
             processed_terms += 1
-
-        search_time = time.time() - start_time
         
-        # Sort by score and remove duplicates with identical scores
+        # Sort by score
         sorted_results = sorted(results.items(), key=lambda x: x[1], reverse=True)
-        
-        # Filter out documents with identical scores (keeping first occurrence)
-        unique_results = []
-        seen_scores = set()
-        for doc_id, score in sorted_results:
-            # Round to handle floating point precision
-            rounded_score = round(score, 6)
-            if rounded_score not in seen_scores:
-                unique_results.append((doc_id, score))
-                seen_scores.add(rounded_score)
-                if len(unique_results) >= k:
-                    break
-        
-        return unique_results, search_time
+        search_time = time.time() - start_time
+
+        return sorted_results, search_time
     
     def run_query(self, query):
         results, search_time = self.search(query)
         print(f"\nSearch completed in {search_time:.4f} seconds")
-        print(f"Found {len(results)} matching documents:")
-        for doc_id, score in results[:10]:  # Show top 10 results
+        
+        # Group results by score
+        score_groups = {}
+        for doc_id, score in results:
+            # Use string formatting to handle floating point precision issues
+            score_key = f"{score:.4f}"
+            if score_key not in score_groups:
+                score_groups[score_key] = []
+            score_groups[score_key].append(doc_id)
+        
+        # Keep only the first URL for each score group
+        filtered_results = []
+        for score_key in sorted(score_groups.keys(), key=float, reverse=True):
+            filtered_results.append((score_groups[score_key][0], float(score_key)))
+        
+        print(f"Found {len(filtered_results)} unique documents:")
+        for doc_id, score in filtered_results[:10]:  # Show top 10 results
             print(f"Score: {score:.4f} - Document: {doc_id}")
 
     def close(self):

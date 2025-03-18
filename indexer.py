@@ -13,6 +13,7 @@ import concurrent.futures
 import threading
 import time
 from functools import lru_cache
+from urllib.parse import urldefrag, urlparse, parse_qs, urlencode
 from filter_duplicates import detect_and_remove_near_duplicates
 
 # Filter out BeautifulSoup warnings
@@ -51,6 +52,8 @@ class InvertedIndex:
         self.processed_docs = 0
         self.total_docs = 0
         self.doc_vectors = {}  # Store document vectors: doc_id -> {term -> tfidf}
+        self.seen_urls = set()  # Track defragged URLs to prevent duplicates
+        self.seen_urls_lock = threading.Lock()  # Lock for thread-safe URL tracking
         
     @lru_cache(maxsize=10000)
     def stem_word(self, word):
@@ -113,10 +116,39 @@ class InvertedIndex:
             normalized_freq = (1 + math.log10(freq)) / math.log10(doc_length)
             target_index[token].append(Posting(doc_id, normalized_freq, term_importance[token]))
     
+    def normalize_url(self, url):
+        """Normalize URL by sorting query parameters and standardizing encoding."""
+        # First defrag the URL
+        url, _ = urldefrag(url)
+        
+        # Parse URL into components
+        parsed = urlparse(url)
+        
+        # Parse and sort query parameters
+        query_params = parse_qs(parsed.query, keep_blank_values=True)
+        
+        # Sort parameters and reconstruct query string
+        sorted_query = urlencode(sorted(query_params.items()), doseq=True)
+        
+        # Reconstruct URL with normalized components
+        normalized = parsed._replace(query=sorted_query).geturl()
+        
+        return normalized
+    
     def process_document(self, doc_id, content, local_index=None):
         """Process a document and add its tokens to the index."""
+        # Normalize URL before processing
+        normalized_url = self.normalize_url(doc_id)
+        
+        # Check if we've already processed this URL
+        with self.seen_urls_lock:
+            if normalized_url in self.seen_urls:
+                # Skip processing if we've seen this URL before
+                return
+            self.seen_urls.add(normalized_url)
+        
         tokens_with_importance, doc_length = self.clean_and_tokenize(content)
-        self.add_tokens(tokens_with_importance, doc_length, doc_id, local_index)
+        self.add_tokens(tokens_with_importance, doc_length, normalized_url, local_index)
         
         # Update processed docs counter
         with self.count_lock:

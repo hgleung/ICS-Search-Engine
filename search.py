@@ -46,6 +46,16 @@ class DiskIndex:
                         }
         
         self.stemmer = PorterStemmer()
+        
+        # Load document vectors for duplicate detection
+        print("Loading document vectors...")
+        if os.path.exists("index_files/doc_vectors.pkl"):
+            with open("index_files/doc_vectors.pkl", "rb") as f:
+                self.doc_vectors = pickle.load(f)
+            print(f"Loaded {len(self.doc_vectors)} document vectors")
+        else:
+            print("Document vectors file not found, near-duplicate detection disabled")
+            self.doc_vectors = {}
     
     def get_postings(self, term):
         """Get postings list for a term from disk."""
@@ -95,6 +105,164 @@ class DiskIndex:
         df = self.vocab_ranges[term]['df']
         # Add 1 to denominator to prevent division by zero and smooth IDF
         return math.log10(self.total_docs / df) if df > 0 else 0
+    
+    def calculate_cosine_similarity(self, vec1, vec2):
+        """Calculate cosine similarity between two document vectors."""
+        # Find common terms
+        common_terms = set(vec1.keys()) & set(vec2.keys())
+        
+        if not common_terms:
+            return 0.0
+        
+        # Calculate dot product
+        dot_product = sum(vec1[term] * vec2[term] for term in common_terms)
+        
+        # Calculate magnitudes
+        mag1 = math.sqrt(sum(val**2 for val in vec1.values()))
+        mag2 = math.sqrt(sum(val**2 for val in vec2.values()))
+        
+        # Avoid division by zero
+        if mag1 == 0 or mag2 == 0:
+            return 0.0
+            
+        return dot_product / (mag1 * mag2)
+    
+    def _calculate_doc_vector_magnitude(self, vec):
+        """Calculate magnitude of a document vector."""
+        return math.sqrt(sum(val**2 for val in vec.values()))
+    
+    def _calculate_vector_similarity_optimized(self, vec1, vec2, mag1, mag2):
+        """Optimized version of cosine similarity calculation."""
+        # Quick size-based heuristic check
+        size_ratio = len(vec1) / len(vec2) if len(vec2) > len(vec1) else len(vec2) / len(vec1)
+        if size_ratio < 0.5:  # If one vector has less than half the terms of the other
+            return 0.0
+        
+        # Find common terms
+        common_terms = set(vec1.keys()) & set(vec2.keys())
+        
+        # Quick check on number of common terms
+        if len(common_terms) < 3:
+            return 0.0
+            
+        # Calculate dot product for common terms only
+        dot_product = sum(vec1[term] * vec2[term] for term in common_terms)
+        
+        # Avoid division by zero
+        if mag1 == 0 or mag2 == 0:
+            return 0.0
+            
+        return dot_product / (mag1 * mag2)
+    
+    def filter_near_duplicates(self, results, threshold=0.95):
+        """Remove near-duplicate documents from results based on cosine similarity."""
+        # If we don't have document vectors, return original results
+        if not self.doc_vectors:
+            return results
+            
+        print("Filtering near-duplicate documents...")
+        start_time = time.time()
+        
+        # If there are very few results, just use the original method
+        if len(results) <= 10:
+            filtered_results = []
+            seen_docs = set()
+            
+            for doc_id, score in results:
+                if doc_id in seen_docs:
+                    continue
+                    
+                if doc_id not in self.doc_vectors:
+                    filtered_results.append((doc_id, score))
+                    continue
+                    
+                doc_vector = self.doc_vectors[doc_id]
+                is_duplicate = False
+                
+                for existing_doc_id, _ in filtered_results:
+                    if existing_doc_id in self.doc_vectors:
+                        existing_vector = self.doc_vectors[existing_doc_id]
+                        similarity = self.calculate_cosine_similarity(doc_vector, existing_vector)
+                        
+                        if similarity >= threshold:
+                            is_duplicate = True
+                            seen_docs.add(doc_id)
+                            break
+                
+                if not is_duplicate:
+                    filtered_results.append((doc_id, score))
+            
+            filter_time = time.time() - start_time
+            print(f"Filtered {len(results) - len(filtered_results)} near-duplicate documents in {filter_time:.4f} seconds")
+            return filtered_results
+        
+        # For larger result sets, use optimized approach
+        
+        # Step 1: Precompute vector magnitudes to avoid redundant calculations
+        doc_magnitudes = {}
+        valid_docs = []
+        
+        # Filter out documents without vectors and precompute magnitudes
+        for doc_id, score in results:
+            if doc_id in self.doc_vectors:
+                doc_vector = self.doc_vectors[doc_id]
+                if doc_vector:  # Only process non-empty vectors
+                    mag = self._calculate_doc_vector_magnitude(doc_vector)
+                    if mag > 0:  # Skip zero-magnitude vectors
+                        doc_magnitudes[doc_id] = mag
+                        valid_docs.append((doc_id, score))
+            else:
+                # Keep documents without vectors (no dupe filtering for these)
+                valid_docs.append((doc_id, score))
+        
+        # Step 2: Sort documents by score (highest first) to prioritize higher scoring docs
+        valid_docs.sort(key=lambda x: x[1], reverse=True)
+        
+        # Step 3: Create filtered results using optimized similarity check
+        filtered_results = []
+        seen_docs = set()
+        
+        for doc_id, score in valid_docs:
+            # Skip if already marked as duplicate
+            if doc_id in seen_docs:
+                continue
+                
+            # If no vector, keep the document
+            if doc_id not in doc_magnitudes:
+                filtered_results.append((doc_id, score))
+                continue
+                
+            doc_vector = self.doc_vectors[doc_id]
+            doc_mag = doc_magnitudes[doc_id]
+            is_duplicate = False
+            
+            # Check against already accepted documents
+            for existing_doc_id, _ in filtered_results:
+                # Skip documents without vectors
+                if existing_doc_id not in doc_magnitudes:
+                    continue
+                
+                existing_vector = self.doc_vectors[existing_doc_id]
+                existing_mag = doc_magnitudes[existing_doc_id]
+                
+                # Use optimized similarity check
+                similarity = self._calculate_vector_similarity_optimized(
+                    doc_vector, existing_vector, doc_mag, existing_mag
+                )
+                
+                if similarity >= threshold:
+                    is_duplicate = True
+                    seen_docs.add(doc_id)
+                    break
+            
+            # Add if not a duplicate
+            if not is_duplicate:
+                filtered_results.append((doc_id, score))
+        
+        filter_time = time.time() - start_time
+        print(f"Filtered {len(results) - len(filtered_results)} near-duplicate documents in {filter_time:.4f} seconds")
+        
+        return filtered_results
     
     def search(self, query, k=1000):
         """Search for documents matching the query using TF-IDF and importance scoring."""
@@ -169,11 +337,14 @@ class DiskIndex:
                 if len(unique_results) >= k:
                     break
         
-        return unique_results, search_time
+        # Filter near-duplicate documents
+        filtered_results = self.filter_near_duplicates(unique_results, threshold=0.95)
+        
+        return filtered_results, search_time
     
     def run_query(self, query):
         results, search_time = self.search(query)
-        print(f"\nSearch completed in {search_time*1000:.0f} milliseconds")
+        print(f"\nSearch completed in {search_time:.4f} seconds")
         print(f"Found {len(results)} matching documents:")
         for doc_id, score in results[:10]:  # Show top 10 results
             print(f"Score: {score:.4f} - Document: {doc_id}")

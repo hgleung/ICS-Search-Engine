@@ -2,6 +2,7 @@ import os
 import json
 import pickle
 import struct
+import warnings
 from bs4 import BeautifulSoup
 from nltk.stem import PorterStemmer
 import re
@@ -12,6 +13,9 @@ import concurrent.futures
 import threading
 import time
 from functools import lru_cache
+
+# Filter out BeautifulSoup warnings
+warnings.filterwarnings("ignore")
 
 class Posting:
     def __init__(self, doc_id, term_freq=1, importance_score=1.0):
@@ -45,6 +49,7 @@ class InvertedIndex:
         self.count_lock = threading.Lock()
         self.processed_docs = 0
         self.total_docs = 0
+        self.doc_vectors = {}  # Store document vectors: doc_id -> {term -> tfidf}
         
     @lru_cache(maxsize=10000)
     def stem_word(self, word):
@@ -142,11 +147,11 @@ class InvertedIndex:
         if not self.index:
             return
             
-        # Create partial indexes directory if it doesn't exist
-        os.makedirs("partial_indexes", exist_ok=True)
+        # Create partial indices directory if it doesn't exist
+        os.makedirs("partial_indices", exist_ok=True)
         
         # Write partial index to disk
-        partial_path = f"partial_indexes/partial_{self.partial_index_count}.pkl"
+        partial_path = f"partial_indices/partial_{self.partial_index_count}.pkl"
         with open(partial_path, "wb") as f:
             pickle.dump(self.index, f)
         
@@ -154,12 +159,12 @@ class InvertedIndex:
         self.partial_index_count += 1
         self.index.clear()
     
-    def _merge_partial_indexes(self):
-        """Merge all partial indexes using a multi-way merge with buffered I/O."""
-        if not os.path.exists("partial_indexes"):
+    def _merge_partial_indices(self):
+        """Merge all partial indices using a multi-way merge with buffered I/O."""
+        if not os.path.exists("partial_indices"):
             return
             
-        print("Merging partial indexes...")
+        print("Merging partial indices...")
         
         # Create output directories
         os.makedirs("index_files", exist_ok=True)
@@ -167,13 +172,13 @@ class InvertedIndex:
         # Initialize doc_id map
         doc_id_map = {}
         
-        # Open all partial indexes simultaneously
+        # Open all partial indices simultaneously
         partial_files = []
         term_queues = []  # List[TermEntry]
         buffer_size = 16384  # 16KB buffer for each file (increased from 8KB)
         
         for i in range(self.partial_index_count):
-            f = open(f"partial_indexes/partial_{i}.pkl", "rb")
+            f = open(f"partial_indices/partial_{i}.pkl", "rb")
             partial_files.append(f)
             partial_index = pickle.load(f)
             if partial_index:
@@ -208,12 +213,22 @@ class InvertedIndex:
         current_postings_file = None
         current_range_name = None
         
+        # Pre-calculate the ranges based on term distribution
+        range_boundaries = []
+        if all_terms:
+            terms_per_range = (len(all_terms) + num_ranges - 1) // num_ranges
+            for i in range(num_ranges):
+                start_idx = i * terms_per_range
+                if start_idx < len(all_terms):
+                    end_idx = min((i + 1) * terms_per_range, len(all_terms))
+                    start_term = all_terms[start_idx]
+                    end_term = all_terms[end_idx - 1]
+                    range_boundaries.append((f"{start_term[:2]}-{end_term[:2]}", start_term, end_term))
+        
         def write_range_files():
-            nonlocal current_range_terms, current_vocab_file, current_postings_file, current_range_name
-            if current_range_terms:
-                start_term = current_range_terms[0]
-                end_term = current_range_terms[-1]
-                current_range_name = f"{start_term[:2]}-{end_term[:2]}"
+            nonlocal current_range_terms, current_vocab_file, current_postings_file, current_range_name, current_range_idx
+            if current_range_terms and current_range_idx < len(range_boundaries):
+                current_range_name = range_boundaries[current_range_idx][0]
                 
                 # Close previous files if open
                 if current_vocab_file:
@@ -226,6 +241,7 @@ class InvertedIndex:
                 current_postings_file = open(f"index_files/postings_{current_range_name}.bin", "wb", buffering=buffer_size)
                 print(f"Created range files for {current_range_name}")
                 current_range_terms = []
+                current_range_idx += 1
         
         # Process terms in sorted order
         while term_queues:
@@ -305,10 +321,10 @@ class InvertedIndex:
         with open("index_files/docid_map.pkl", "wb") as f:
             pickle.dump(doc_id_map, f)
         
-        # Remove partial indexes
+        # Remove partial indices
         for i in range(self.partial_index_count):
-            os.remove(f"partial_indexes/partial_{i}.pkl")
-        os.rmdir("partial_indexes")
+            os.remove(f"partial_indices/partial_{i}.pkl")
+        os.rmdir("partial_indices")
         
         # Print statistics
         total_vocab_size = sum(os.path.getsize(f"index_files/vocab_{f.split('_')[1]}")
@@ -354,9 +370,78 @@ class InvertedIndex:
                 self.merge_local_index(local_index)
     
     def finalize(self):
-        """Write final partial index and merge all indexes."""
+        """Write final partial index and merge all indices."""
         self._write_partial_index()  # Write any remaining terms
-        self._merge_partial_indexes()
+        self._merge_partial_indices()
+        self._create_document_vectors()
+        
+    def _create_document_vectors(self):
+        """Create document vectors with TF-IDF weights and save to file."""
+        print("Creating document vectors...")
+        
+        # We need to calculate document vectors after the index is finalized
+        # so that we have access to all terms and can calculate IDF properly
+        
+        # First, load the vocabulary to get document frequencies
+        vocab_terms = {}  # term -> df
+        for filename in os.listdir("index_files"):
+            if filename.startswith("vocab_"):
+                with open(f"index_files/{filename}", "r", encoding="utf-8") as f:
+                    for line in f:
+                        term, df, _, _ = line.strip().split("\t")
+                        vocab_terms[term] = int(df)
+        
+        # Count total documents
+        with open("index_files/docid_map.pkl", "rb") as f:
+            docid_map = pickle.load(f)
+        total_docs = len(docid_map)
+        
+        # Create vectors for all documents
+        doc_vectors = {}
+        
+        # Iterate through all vocabulary files
+        for filename in os.listdir("index_files"):
+            if not filename.startswith("vocab_"):
+                continue
+                
+            range_name = filename.split("_")[1].split(".")[0]
+            postings_path = f"index_files/postings_{range_name}.bin"
+            
+            with open(f"index_files/{filename}", "r", encoding="utf-8") as vocab_file:
+                with open(postings_path, "rb") as postings_file:
+                    for line in vocab_file:
+                        term, df, offset, length = line.strip().split("\t")
+                        df = int(df)
+                        offset = int(offset)
+                        length = int(length)
+                        
+                        # Calculate IDF for this term
+                        idf = math.log10(total_docs / df) if df > 0 else 0
+                        
+                        # Read postings
+                        postings_file.seek(offset)
+                        postings_bytes = postings_file.read(length)
+                        
+                        # Process each posting
+                        for i in range(length // 12):
+                            start = i * 12
+                            doc_id_hash, tf, importance = struct.unpack("Iff", postings_bytes[start:start + 12])
+                            doc_id = docid_map[doc_id_hash]
+                            
+                            # Calculate TF-IDF score
+                            tfidf = tf * idf * importance
+                            
+                            # Add to document vector
+                            if doc_id not in doc_vectors:
+                                doc_vectors[doc_id] = {}
+                            doc_vectors[doc_id][term] = tfidf
+        
+        # Save document vectors
+        print(f"Saving {len(doc_vectors)} document vectors...")
+        with open("index_files/doc_vectors.pkl", "wb") as f:
+            pickle.dump(doc_vectors, f)
+        
+        print(f"Document vectors saved successfully, size: {os.path.getsize('index_files/doc_vectors.pkl') / (1024*1024):.2f} MB")
 
 def main():
     start_time = time.time()
